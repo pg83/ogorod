@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -161,6 +162,7 @@ func runFetches(ctx context.Context, s3 *S3Client, storer *filesystem.Storage, r
 
 	downloaded := 0
 	queue := want
+	lastReport := time.Now()
 
 	seen := make(map[plumbing.Hash]struct{})
 
@@ -210,6 +212,11 @@ func runFetches(ctx context.Context, s3 *S3Client, storer *filesystem.Storage, r
 
 		Throw2(storer.SetEncodedObject(local))
 		downloaded++
+
+		if time.Since(lastReport) >= 2*time.Second {
+			fmt.Fprintf(os.Stderr, "ogorod: fetched %d objects (%d queued)...\n", downloaded, len(queue))
+			lastReport = time.Now()
+		}
 
 		queue = append(queue, childHashes(storer, obj)...)
 	}
@@ -363,6 +370,8 @@ func uploadReachable(ctx context.Context, s3 *S3Client, storer *filesystem.Stora
 	}
 
 	queue := []plumbing.Hash{root}
+	uploaded := 0
+	lastReport := time.Now()
 
 	for len(queue) > 0 {
 		h := queue[0]
@@ -377,9 +386,20 @@ func uploadReachable(ctx context.Context, s3 *S3Client, storer *filesystem.Stora
 		obj := Throw2(storer.EncodedObject(plumbing.AnyObject, h))
 		blob := EncodeLoose(obj)
 		s3.Put(ctx, h.String(), blob)
+		uploaded++
+
+		// Every 2s of wall-clock: print a progress line to stderr.
+		// git streams the helper's stderr to the user live, so the
+		// operator gets real-time feedback on long pushes.
+		if time.Since(lastReport) >= 2*time.Second {
+			fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (%d queued)...\n", uploaded, len(queue))
+			lastReport = time.Now()
+		}
 
 		queue = append(queue, childHashes(storer, obj)...)
 	}
+
+	fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (root %s)\n", uploaded, root)
 }
 
 // memStorer gives child-decode helpers something to satisfy their
