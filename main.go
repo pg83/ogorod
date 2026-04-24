@@ -31,12 +31,14 @@ func main() {
 
 func adminMain(args []string) {
 	if len(args) < 1 {
-		ThrowFmt("usage: ogorod {gc} [args...]")
+		ThrowFmt("usage: ogorod {gc|repack} [args...]")
 	}
 
 	switch args[0] {
 	case "gc":
 		gcMain(args[1:])
+	case "repack":
+		repackMain(args[1:])
 	default:
 		ThrowFmt("unknown subcommand: %q", args[0])
 	}

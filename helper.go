@@ -155,6 +155,26 @@ type fetchReq struct {
 }
 
 func runFetches(ctx context.Context, s3 *S3Client, storer *filesystem.Storage, reqs []fetchReq) {
+	// Pull down any pack/idx files from the remote first; after
+	// this, storer.EncodedObject() finds pack-stored objects
+	// natively and our walker only has to pull leftover loose
+	// objects individually. One pack download replaces thousands
+	// of per-sha HTTP roundtrips.
+	gitDir := os.Getenv("GIT_DIR")
+
+	if gitDir == "" {
+		gitDir = ".git"
+	}
+
+	if n := loadPacksIntoLocal(ctx, s3, gitDir); n > 0 {
+		fmt.Fprintf(os.Stderr, "ogorod: downloaded %d new pack(s)\n", n)
+
+		// Reload the storer so it notices the new packs on disk.
+		// filesystem.Storage caches its packfile scan at init; a
+		// repo-reopen is the cheapest reliable invalidation.
+		*storer = *filesystem.NewStorage(osfs.New(gitDir), cache.NewObjectLRUDefault())
+	}
+
 	// Each fetch request names a tip by sha; we need to pull that
 	// object plus its transitive dependencies (commit → tree → blobs,
 	// parents, …) until everything's locally present.

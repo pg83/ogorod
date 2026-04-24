@@ -14,14 +14,22 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-// S3Client wraps MinIO object operations scoped to one repository
-// under <bucket>/<repo>/objects/. Keys are flat — no two-byte
-// directory sharding like git's loose-object layout, that's a
-// filesystem-inode concern and S3 doesn't care.
+// S3Client wraps MinIO object operations scoped to one repository.
+// Layout:
+//
+//	<bucket>/<repo>/objects/<sha>          loose object (zlib-
+//	                                       compressed git loose
+//	                                       format)
+//	<bucket>/<repo>/packs/pack-<sha>.pack  packfile (git native)
+//	<bucket>/<repo>/packs/pack-<sha>.idx   packfile index (git v2)
+//
+// Keys are flat — no two-byte directory sharding (that's a
+// filesystem-inode concern, S3 doesn't care).
 type S3Client struct {
-	cli    *s3.Client
-	bucket string
-	prefix string
+	cli        *s3.Client
+	bucket     string
+	objPrefix  string
+	packPrefix string
 }
 
 func newS3Client(env Env, repo string) *S3Client {
@@ -39,14 +47,19 @@ func newS3Client(env Env, repo string) *S3Client {
 	})
 
 	return &S3Client{
-		cli:    cli,
-		bucket: env.S3Bucket,
-		prefix: repo + "/objects/",
+		cli:        cli,
+		bucket:     env.S3Bucket,
+		objPrefix:  repo + "/objects/",
+		packPrefix: repo + "/packs/",
 	}
 }
 
 func (s *S3Client) key(sha string) string {
-	return s.prefix + sha
+	return s.objPrefix + sha
+}
+
+func (s *S3Client) packKey(name string) string {
+	return s.packPrefix + name
 }
 
 // Get returns the blob's raw bytes and true if present, (nil, false)
@@ -114,12 +127,12 @@ func (s *S3Client) Delete(ctx context.Context, sha string) {
 	}
 }
 
-// ListAll returns every sha currently stored under this repo's
-// prefix. Used by GC to diff against the reachable set.
+// ListAll returns every sha currently stored as a loose object
+// under this repo. Used by GC to diff against the reachable set.
 func (s *S3Client) ListAll(ctx context.Context) []string {
 	pager := s3.NewListObjectsV2Paginator(s.cli, &s3.ListObjectsV2Input{
 		Bucket: &s.bucket,
-		Prefix: &s.prefix,
+		Prefix: &s.objPrefix,
 	})
 
 	var out []string
@@ -132,9 +145,87 @@ func (s *S3Client) ListAll(ctx context.Context) []string {
 				continue
 			}
 
-			sha := strings.TrimPrefix(*obj.Key, s.prefix)
+			sha := strings.TrimPrefix(*obj.Key, s.objPrefix)
 			out = append(out, sha)
 		}
+	}
+
+	return out
+}
+
+// GetPack and PutPack operate on raw pack/idx bytes. Pack names
+// include their extension (pack-<sha>.pack or pack-<sha>.idx).
+func (s *S3Client) GetPack(ctx context.Context, name string) ([]byte, bool) {
+	out, err := s.cli.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
+		Key:    aws.String(s.packKey(name)),
+	})
+
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil, false
+		}
+
+		Throw(err)
+	}
+
+	defer out.Body.Close()
+	body := Throw2(io.ReadAll(out.Body))
+
+	return body, true
+}
+
+func (s *S3Client) PutPack(ctx context.Context, name string, data []byte) {
+	Throw2(s.cli.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &s.bucket,
+		Key:    aws.String(s.packKey(name)),
+		Body:   bytes.NewReader(data),
+	}))
+}
+
+func (s *S3Client) DeletePack(ctx context.Context, name string) {
+	_, err := s.cli.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &s.bucket,
+		Key:    aws.String(s.packKey(name)),
+	})
+
+	if err != nil && !isS3NotFound(err) {
+		Throw(err)
+	}
+}
+
+// ListPacks returns the pack basenames (no extension) stored for
+// this repo. For each pack-<sha>.pack / pack-<sha>.idx pair we
+// return just pack-<sha> once.
+func (s *S3Client) ListPacks(ctx context.Context) []string {
+	pager := s3.NewListObjectsV2Paginator(s.cli, &s3.ListObjectsV2Input{
+		Bucket: &s.bucket,
+		Prefix: &s.packPrefix,
+	})
+
+	seen := make(map[string]struct{})
+
+	for pager.HasMorePages() {
+		page := Throw2(pager.NextPage(ctx))
+
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+
+			name := strings.TrimPrefix(*obj.Key, s.packPrefix)
+
+			if strings.HasSuffix(name, ".pack") {
+				seen[strings.TrimSuffix(name, ".pack")] = struct{}{}
+			} else if strings.HasSuffix(name, ".idx") {
+				seen[strings.TrimSuffix(name, ".idx")] = struct{}{}
+			}
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for n := range seen {
+		out = append(out, n)
 	}
 
 	return out
