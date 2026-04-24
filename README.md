@@ -20,7 +20,10 @@ filesystem, no Postgres-HA tail dependency.
 # in MinIO (one-time):
 mc mb minio/ogorod --ignore-existing
 
-# environment for the helper (per client / per CI worker):
+# environment for the helper (per client / per CI worker).
+# OGOROD_* takes priority; AWS_*/ETCDCTL_* are accepted as
+# fallbacks so a box already set up with aws-cli/mc/etcdctl
+# needs no extra variables:
 export OGOROD_ETCD_ENDPOINTS=lab1.nebula:8020,lab2.nebula:8020,lab3.nebula:8020
 export OGOROD_S3_ENDPOINT=http://lab1.eth1:8012
 export OGOROD_S3_ACCESS_KEY=...

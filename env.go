@@ -15,18 +15,38 @@ type Env struct {
 	S3Bucket      string
 }
 
-func loadEnv() Env {
-	e := Env{
-		S3Endpoint:  os.Getenv("OGOROD_S3_ENDPOINT"),
-		S3AccessKey: os.Getenv("OGOROD_S3_ACCESS_KEY"),
-		S3SecretKey: os.Getenv("OGOROD_S3_SECRET_KEY"),
-		S3Bucket:    os.Getenv("OGOROD_S3_BUCKET"),
+// lookup returns the value of the first env var that's set and
+// non-empty. OGOROD_ names come first so a user with both a
+// pre-existing AWS/etcdctl environment and ogorod-specific
+// overrides sees the overrides win.
+func lookup(names ...string) string {
+	for _, n := range names {
+		if v := os.Getenv(n); v != "" {
+			return v
+		}
 	}
 
-	eps := os.Getenv("OGOROD_ETCD_ENDPOINTS")
+	return ""
+}
+
+func loadEnv() Env {
+	e := Env{
+		// AWS_ENDPOINT_URL_S3 is the service-specific override;
+		// AWS_ENDPOINT_URL is the global fallback. Both are
+		// respected by aws-sdk-go-v2 itself, but we read them
+		// directly so the diagnostic (which var to set) is crisp.
+		S3Endpoint:  lookup("OGOROD_S3_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"),
+		S3AccessKey: lookup("OGOROD_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"),
+		S3SecretKey: lookup("OGOROD_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"),
+		S3Bucket:    lookup("OGOROD_S3_BUCKET"),
+	}
+
+	// ETCDCTL_ENDPOINTS is already set on every lab host for
+	// etcdctl lock/dedup scripts; reuse it.
+	eps := lookup("OGOROD_ETCD_ENDPOINTS", "ETCDCTL_ENDPOINTS")
 
 	if eps == "" {
-		ThrowFmt("OGOROD_ETCD_ENDPOINTS is required (comma-separated host:port)")
+		ThrowFmt("OGOROD_ETCD_ENDPOINTS or ETCDCTL_ENDPOINTS is required (comma-separated host:port)")
 	}
 
 	for _, x := range strings.Split(eps, ",") {
@@ -35,16 +55,16 @@ func loadEnv() Env {
 		}
 	}
 
-	require := func(name, value string) {
+	require := func(value string, names ...string) {
 		if value == "" {
-			ThrowFmt("%s is required", name)
+			ThrowFmt("set one of: %s", strings.Join(names, ", "))
 		}
 	}
 
-	require("OGOROD_S3_ENDPOINT", e.S3Endpoint)
-	require("OGOROD_S3_ACCESS_KEY", e.S3AccessKey)
-	require("OGOROD_S3_SECRET_KEY", e.S3SecretKey)
-	require("OGOROD_S3_BUCKET", e.S3Bucket)
+	require(e.S3Endpoint, "OGOROD_S3_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+	require(e.S3AccessKey, "OGOROD_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID")
+	require(e.S3SecretKey, "OGOROD_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
+	require(e.S3Bucket, "OGOROD_S3_BUCKET")
 
 	return e
 }

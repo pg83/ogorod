@@ -48,15 +48,19 @@ Flat — no two-byte prefix sharding (filesystem reason, not S3).
 
 ## Auth / endpoints
 
-All from env, mirroring gorn's pattern. URL is endpoint-free; helper resolves cluster from env:
+All from env. URL is endpoint-free; helper resolves cluster from env.
 
-```
-OGOROD_ETCD_ENDPOINTS    lab1.nebula:8020,lab2.nebula:8020,lab3.nebula:8020
-OGOROD_S3_ENDPOINT       http://lab1.eth1:8012
-OGOROD_S3_ACCESS_KEY     ...
-OGOROD_S3_SECRET_KEY     ...
-OGOROD_S3_BUCKET         ogorod
-```
+OGOROD_* takes precedence; standard AWS / etcdctl vars are fallbacks
+so a box that already talks to MinIO via `aws`/`mc` and etcd via
+`etcdctl` needs no extra configuration to use ogorod too.
+
+| field       | primary                  | fallbacks                                  |
+|-------------|--------------------------|--------------------------------------------|
+| etcd        | `OGOROD_ETCD_ENDPOINTS`  | `ETCDCTL_ENDPOINTS`                        |
+| S3 endpoint | `OGOROD_S3_ENDPOINT`     | `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`  |
+| S3 access   | `OGOROD_S3_ACCESS_KEY`   | `AWS_ACCESS_KEY_ID`                        |
+| S3 secret   | `OGOROD_S3_SECRET_KEY`   | `AWS_SECRET_ACCESS_KEY`                    |
+| S3 bucket   | `OGOROD_S3_BUCKET`       | (no standard fallback — bucket is ours)    |
 
 URL: `ogorod://<repo>` — repo name is the only payload.
 
