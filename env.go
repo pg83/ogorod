@@ -30,41 +30,45 @@ func lookup(names ...string) string {
 }
 
 func loadEnv() Env {
+	// Per-field: primary OGOROD_* name first, then AWS/etcdctl
+	// conventional fallbacks. We resolve every field up-front then
+	// report every missing one together — one validation error pass
+	// beats the "fix, rerun, see next error, repeat" chain.
+	fields := [][]string{
+		{"OGOROD_ETCD_ENDPOINTS", "ETCDCTL_ENDPOINTS"},
+		{"OGOROD_S3_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"},
+		{"OGOROD_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"},
+		{"OGOROD_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"},
+		{"OGOROD_S3_BUCKET"},
+	}
+
+	values := make([]string, len(fields))
+	var missing []string
+
+	for i, names := range fields {
+		values[i] = lookup(names...)
+
+		if values[i] == "" {
+			missing = append(missing, "  "+strings.Join(names, " | "))
+		}
+	}
+
+	if len(missing) > 0 {
+		ThrowFmt("missing env config; set at least one variable per line:\n%s", strings.Join(missing, "\n"))
+	}
+
 	e := Env{
-		// AWS_ENDPOINT_URL_S3 is the service-specific override;
-		// AWS_ENDPOINT_URL is the global fallback. Both are
-		// respected by aws-sdk-go-v2 itself, but we read them
-		// directly so the diagnostic (which var to set) is crisp.
-		S3Endpoint:  lookup("OGOROD_S3_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"),
-		S3AccessKey: lookup("OGOROD_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"),
-		S3SecretKey: lookup("OGOROD_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"),
-		S3Bucket:    lookup("OGOROD_S3_BUCKET"),
+		S3Endpoint:  values[1],
+		S3AccessKey: values[2],
+		S3SecretKey: values[3],
+		S3Bucket:    values[4],
 	}
 
-	// ETCDCTL_ENDPOINTS is already set on every lab host for
-	// etcdctl lock/dedup scripts; reuse it.
-	eps := lookup("OGOROD_ETCD_ENDPOINTS", "ETCDCTL_ENDPOINTS")
-
-	if eps == "" {
-		ThrowFmt("OGOROD_ETCD_ENDPOINTS or ETCDCTL_ENDPOINTS is required (comma-separated host:port)")
-	}
-
-	for _, x := range strings.Split(eps, ",") {
+	for _, x := range strings.Split(values[0], ",") {
 		if x = strings.TrimSpace(x); x != "" {
 			e.EtcdEndpoints = append(e.EtcdEndpoints, x)
 		}
 	}
-
-	require := func(value string, names ...string) {
-		if value == "" {
-			ThrowFmt("set one of: %s", strings.Join(names, ", "))
-		}
-	}
-
-	require(e.S3Endpoint, "OGOROD_S3_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
-	require(e.S3AccessKey, "OGOROD_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID")
-	require(e.S3SecretKey, "OGOROD_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
-	require(e.S3Bucket, "OGOROD_S3_BUCKET")
 
 	return e
 }
