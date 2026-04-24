@@ -107,7 +107,15 @@ func loadEnv() Env {
 	endpoint := orElse(lookup("OGOROD_S3_ENDPOINT"), compoundEndpoint, lookup("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"))
 	access := orElse(lookup("OGOROD_S3_ACCESS_KEY"), compoundAccess, lookup("AWS_ACCESS_KEY_ID"))
 	secret := orElse(lookup("OGOROD_S3_SECRET_KEY"), compoundSecret, lookup("AWS_SECRET_ACCESS_KEY"))
+
+	// Bucket has no standard cross-tool env convention, so we
+	// default to the project name rather than making it required.
+	// Override with OGOROD_S3_BUCKET if the bucket lives elsewhere.
 	bucket := lookup("OGOROD_S3_BUCKET")
+
+	if bucket == "" {
+		bucket = "ogorod"
+	}
 
 	// Collect every missing field for a single diagnostic. Each
 	// line shows the full list of names that would fill that field,
@@ -121,7 +129,6 @@ func loadEnv() Env {
 		{endpoint, "OGOROD_S3_ENDPOINT | OGOROD_S3_URL | MC_HOST_<alias> | AWS_ENDPOINT_URL_S3 | AWS_ENDPOINT_URL"},
 		{access, "OGOROD_S3_ACCESS_KEY | OGOROD_S3_URL | MC_HOST_<alias> | AWS_ACCESS_KEY_ID"},
 		{secret, "OGOROD_S3_SECRET_KEY | OGOROD_S3_URL | MC_HOST_<alias> | AWS_SECRET_ACCESS_KEY"},
-		{bucket, "OGOROD_S3_BUCKET"},
 	}
 
 	var missing []string
