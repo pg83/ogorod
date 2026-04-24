@@ -7,18 +7,16 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
-
-const uploadWorkers = 32
 
 // helperMain is the entry point git invokes for `ogorod://` remotes.
 // argv is everything after the binary name:
@@ -387,59 +385,28 @@ func runPushes(ctx context.Context, ec *EtcdClient, s3 *S3Client, storer *filesy
 // isn't actually an ancestor) we re-upload some objects — S3 PUT
 // is idempotent so this is a bandwidth cost only, not a correctness
 // issue.
-type uploadJob struct {
-	hash plumbing.Hash
-	blob []byte
-}
-
+// uploadReachable walks local DAG from root (stopping at remote
+// tips in stopAt), collects every hash along the way, then packs
+// them all into ONE packfile and uploads pack+idx to S3 in two
+// PUTs.
+//
+// This replaces the earlier per-object upload model: loose-per-PUT
+// was LAN-latency-bound (one HTTP roundtrip per tiny object) and
+// took tens of minutes on a first push. Packing delta-compresses
+// the whole working set, shrinks total bytes ~10x on source
+// repos, and collapses N HTTP roundtrips into 2.
 func uploadReachable(ctx context.Context, s3 *S3Client, storer *filesystem.Storage, root plumbing.Hash, stopAt map[plumbing.Hash]struct{}) {
 	seen := make(map[plumbing.Hash]struct{}, len(stopAt))
 	for h := range stopAt {
 		seen[h] = struct{}{}
 	}
 
-	// DAG walk is single-threaded (cheap, CPU-bound on small
-	// objects) but feeds a pool of uploadWorkers doing the actual
-	// S3 PUTs, since each PUT is one HTTP roundtrip and the LAN
-	// latency is the bottleneck. Pool size 32 is empirical — MinIO
-	// on a single-host LAN tops out somewhere in the 100s of
-	// concurrent requests before saturating erasure-coded writes.
-	jobs := make(chan uploadJob, uploadWorkers*2)
-
-	var uploaded int64
-	var firstErr atomic.Pointer[Exception]
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < uploadWorkers; i++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			exc := Try(func() {
-				for job := range jobs {
-					s3.Put(ctx, job.hash.String(), job.blob)
-					atomic.AddInt64(&uploaded, 1)
-				}
-			})
-
-			if exc != nil {
-				firstErr.CompareAndSwap(nil, exc)
-			}
-		}()
-	}
-
 	queue := []plumbing.Hash{root}
+	var hashes []plumbing.Hash
+
 	lastReport := time.Now()
 
 	for len(queue) > 0 {
-		// Early exit if a worker has already failed — no point
-		// enqueueing more work that's destined to fail too.
-		if firstErr.Load() != nil {
-			break
-		}
-
 		h := queue[0]
 		queue = queue[1:]
 
@@ -449,29 +416,63 @@ func uploadReachable(ctx context.Context, s3 *S3Client, storer *filesystem.Stora
 
 		seen[h] = struct{}{}
 
-		obj := Throw2(storer.EncodedObject(plumbing.AnyObject, h))
-		blob := EncodeLoose(obj)
+		obj, err := storer.EncodedObject(plumbing.AnyObject, h)
 
-		jobs <- uploadJob{hash: h, blob: blob}
-
-		if time.Since(lastReport) >= 2*time.Second {
-			fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (%d queued)...\n",
-				atomic.LoadInt64(&uploaded), len(queue))
-			lastReport = time.Now()
+		if err != nil {
+			// A stopAt tip that isn't actually an ancestor, or a
+			// dangling hash. Shouldn't happen in a fast-forward
+			// push; skip quietly.
+			continue
 		}
 
+		hashes = append(hashes, h)
 		queue = append(queue, childHashes(storer, obj)...)
+
+		if time.Since(lastReport) >= 2*time.Second {
+			fmt.Fprintf(os.Stderr, "ogorod: walked %d objects (%d queued)...\n",
+				len(hashes), len(queue))
+			lastReport = time.Now()
+		}
 	}
 
-	close(jobs)
-	wg.Wait()
+	if len(hashes) == 0 {
+		fmt.Fprintln(os.Stderr, "ogorod: nothing new to upload")
 
-	if e := firstErr.Load(); e != nil {
-		panic(e)
+		return
 	}
 
-	fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (root %s)\n",
-		atomic.LoadInt64(&uploaded), root)
+	fmt.Fprintf(os.Stderr, "ogorod: packing %d new objects...\n", len(hashes))
+
+	// Build pack + idx in-memory via go-git's PackfileWriter.
+	// The writer accepts raw pack bytes (from the Encoder below)
+	// and on Close() emits both .pack and .idx into the backing
+	// filesystem — we just pull them out afterwards.
+	scratchFS := memfs.New()
+	scratch := filesystem.NewStorage(scratchFS, cache.NewObjectLRUDefault())
+
+	pw := Throw2(scratch.PackfileWriter())
+
+	// Source for encoding is the LOCAL storer (real git repo on
+	// disk) — it already knows how to read loose + pack-stored
+	// objects. Only the hashes we just collected get written.
+	enc := packfile.NewEncoder(pw, storer, false /*useRefDeltas*/)
+	packSha := Throw2(enc.Encode(hashes, 10 /*packWindow*/))
+
+	Throw(pw.Close())
+
+	packName := "pack-" + packSha.String()
+
+	packBytes := readFS(scratchFS, "objects/pack/"+packName+".pack")
+	idxBytes := readFS(scratchFS, "objects/pack/"+packName+".idx")
+
+	fmt.Fprintf(os.Stderr, "ogorod: uploading pack (%d objects, %.1f MB) + idx (%.1f KB)...\n",
+		len(hashes), float64(len(packBytes))/1e6, float64(len(idxBytes))/1e3)
+
+	// Pack before idx — see repack's comment.
+	s3.PutPack(ctx, packName+".pack", packBytes)
+	s3.PutPack(ctx, packName+".idx", idxBytes)
+
+	fmt.Fprintf(os.Stderr, "ogorod: pushed pack %s\n", packSha)
 }
 
 // memStorer gives child-decode helpers something to satisfy their
