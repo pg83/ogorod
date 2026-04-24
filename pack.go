@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/storage/filesystem"
 )
@@ -160,4 +162,56 @@ func loadPacksIntoLocal(ctx context.Context, s3 *S3Client, gitDir string) int {
 	}
 
 	return downloaded
+}
+
+// remotePackHashes walks every .idx file in .git/objects/pack/,
+// unions their entry hashes, returns the set. Used on push as
+// stopAt: any object whose sha is in a remote pack is already on
+// S3 and doesn't need re-uploading.
+//
+// Caller must have loadPacksIntoLocal'd first, or the set will be
+// empty on a just-cloned repo that hasn't yet fetched.
+func remotePackHashes(gitDir string) map[plumbing.Hash]struct{} {
+	out := make(map[plumbing.Hash]struct{})
+
+	packDir := gitDir + "/objects/pack"
+
+	entries, err := os.ReadDir(packDir)
+
+	if err != nil {
+		return out
+	}
+
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".idx") {
+			continue
+		}
+
+		f := Throw2(os.Open(packDir + "/" + e.Name()))
+
+		mi := idxfile.NewMemoryIndex()
+		dec := idxfile.NewDecoder(f)
+		Throw(dec.Decode(mi))
+		f.Close()
+
+		it, err := mi.Entries()
+
+		if err != nil {
+			continue
+		}
+
+		for {
+			entry, err := it.Next()
+
+			if err == io.EOF {
+				break
+			}
+
+			Throw(err)
+
+			out[entry.Hash] = struct{}{}
+		}
+	}
+
+	return out
 }

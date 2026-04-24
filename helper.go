@@ -276,14 +276,32 @@ func parsePushReq(spec string) pushReq {
 }
 
 func runPushes(ctx context.Context, ec *EtcdClient, s3 *S3Client, storer *filesystem.Storage, reqs []pushReq) {
-	// Snapshot the current remote refs. Two uses:
-	//   1. Seed the local walker's "stop-at" set so we don't re-upload
-	//      objects already on the remote (reachable from any existing
-	//      tip, approximately).
-	//   2. Feed the etcd CAS txn: each push's OldSha comes from here.
+	// Snapshot the current remote refs for etcd-CAS payloads below.
 	remoteRefs := ec.ListRefs(ctx)
 
-	stopAt := make(map[plumbing.Hash]struct{}, len(remoteRefs))
+	// Build stopAt = every object already on the remote. Just
+	// tip-shas (what runPushes used to do) only stops the walker
+	// at top-level commits; it keeps walking their trees and
+	// re-uploads every unchanged blob. For a small incremental
+	// push that's the difference between 3 objects and 10000.
+	//
+	// Two sources of "already on remote":
+	//   a) loaded packs — sync any we're missing, then read all
+	//      pack idx'es from .git/objects/pack for their sha lists.
+	//   b) loose objects still hanging around pre-repack.
+	gitDir := os.Getenv("GIT_DIR")
+
+	if gitDir == "" {
+		gitDir = ".git"
+	}
+
+	if n := loadPacksIntoLocal(ctx, s3, gitDir); n > 0 {
+		fmt.Fprintf(os.Stderr, "ogorod: pulled %d new pack(s) before push\n", n)
+
+		*storer = *filesystem.NewStorage(osfs.New(gitDir), cache.NewObjectLRUDefault())
+	}
+
+	stopAt := remotePackHashes(gitDir)
 
 	for name, sha := range remoteRefs {
 		if name == "HEAD" {
@@ -292,6 +310,8 @@ func runPushes(ctx context.Context, ec *EtcdClient, s3 *S3Client, storer *filesy
 
 		stopAt[plumbing.NewHash(sha)] = struct{}{}
 	}
+
+	fmt.Fprintf(os.Stderr, "ogorod: stopAt has %d already-on-remote objects\n", len(stopAt))
 
 	// Ref deletions are pushes with Src == "". Handle them separately
 	// from object-upload pushes, since no objects need to move.
