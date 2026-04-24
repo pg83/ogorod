@@ -1,0 +1,12 @@
+# Go build artifacts
+git-remote-ogorod
+ogorod
+*.test
+*.prof
+*.out
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
