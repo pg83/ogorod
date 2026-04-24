@@ -6,14 +6,13 @@ import (
 	"path/filepath"
 )
 
-// One binary, two roles. argv[0] basename selects:
+// One binary, two entry points dispatched by argv[0] basename:
 //
-//   git-remote-ogorod <remote> <url>   ← git invokes this when it sees
+//   git-remote-ogorod <remote> <url>   invoked by git when it sees
 //                                        ogorod://<repo> remotes
-//   ogorod <subcommand> [args...]       ← admin CLI (gc, ...)
+//   ogorod <subcommand> [args...]      admin CLI (gc, …)
 //
-// Symlink the same binary to both names on install.
-
+// Install both names as symlinks (or hardlinks) to the same file.
 func main() {
 	exc := Try(func() {
 		switch filepath.Base(os.Args[0]) {
@@ -30,10 +29,6 @@ func main() {
 	})
 }
 
-func helperMain(args []string) {
-	ThrowFmt("git-remote-ogorod: not implemented yet")
-}
-
 func adminMain(args []string) {
 	if len(args) < 1 {
 		ThrowFmt("usage: ogorod {gc} [args...]")
@@ -41,7 +36,7 @@ func adminMain(args []string) {
 
 	switch args[0] {
 	case "gc":
-		ThrowFmt("ogorod gc: not implemented yet")
+		gcMain(args[1:])
 	default:
 		ThrowFmt("unknown subcommand: %q", args[0])
 	}
