@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-git/go-billy/v5/osfs"
@@ -15,6 +17,8 @@ import (
 	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
+
+const uploadWorkers = 32
 
 // helperMain is the entry point git invokes for `ogorod://` remotes.
 // argv is everything after the binary name:
@@ -363,17 +367,59 @@ func runPushes(ctx context.Context, ec *EtcdClient, s3 *S3Client, storer *filesy
 // isn't actually an ancestor) we re-upload some objects — S3 PUT
 // is idempotent so this is a bandwidth cost only, not a correctness
 // issue.
+type uploadJob struct {
+	hash plumbing.Hash
+	blob []byte
+}
+
 func uploadReachable(ctx context.Context, s3 *S3Client, storer *filesystem.Storage, root plumbing.Hash, stopAt map[plumbing.Hash]struct{}) {
 	seen := make(map[plumbing.Hash]struct{}, len(stopAt))
 	for h := range stopAt {
 		seen[h] = struct{}{}
 	}
 
+	// DAG walk is single-threaded (cheap, CPU-bound on small
+	// objects) but feeds a pool of uploadWorkers doing the actual
+	// S3 PUTs, since each PUT is one HTTP roundtrip and the LAN
+	// latency is the bottleneck. Pool size 32 is empirical — MinIO
+	// on a single-host LAN tops out somewhere in the 100s of
+	// concurrent requests before saturating erasure-coded writes.
+	jobs := make(chan uploadJob, uploadWorkers*2)
+
+	var uploaded int64
+	var firstErr atomic.Pointer[Exception]
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < uploadWorkers; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			exc := Try(func() {
+				for job := range jobs {
+					s3.Put(ctx, job.hash.String(), job.blob)
+					atomic.AddInt64(&uploaded, 1)
+				}
+			})
+
+			if exc != nil {
+				firstErr.CompareAndSwap(nil, exc)
+			}
+		}()
+	}
+
 	queue := []plumbing.Hash{root}
-	uploaded := 0
 	lastReport := time.Now()
 
 	for len(queue) > 0 {
+		// Early exit if a worker has already failed — no point
+		// enqueueing more work that's destined to fail too.
+		if firstErr.Load() != nil {
+			break
+		}
+
 		h := queue[0]
 		queue = queue[1:]
 
@@ -385,21 +431,27 @@ func uploadReachable(ctx context.Context, s3 *S3Client, storer *filesystem.Stora
 
 		obj := Throw2(storer.EncodedObject(plumbing.AnyObject, h))
 		blob := EncodeLoose(obj)
-		s3.Put(ctx, h.String(), blob)
-		uploaded++
 
-		// Every 2s of wall-clock: print a progress line to stderr.
-		// git streams the helper's stderr to the user live, so the
-		// operator gets real-time feedback on long pushes.
+		jobs <- uploadJob{hash: h, blob: blob}
+
 		if time.Since(lastReport) >= 2*time.Second {
-			fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (%d queued)...\n", uploaded, len(queue))
+			fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (%d queued)...\n",
+				atomic.LoadInt64(&uploaded), len(queue))
 			lastReport = time.Now()
 		}
 
 		queue = append(queue, childHashes(storer, obj)...)
 	}
 
-	fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (root %s)\n", uploaded, root)
+	close(jobs)
+	wg.Wait()
+
+	if e := firstErr.Load(); e != nil {
+		panic(e)
+	}
+
+	fmt.Fprintf(os.Stderr, "ogorod: uploaded %d objects (root %s)\n",
+		atomic.LoadInt64(&uploaded), root)
 }
 
 // memStorer gives child-decode helpers something to satisfy their
