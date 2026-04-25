@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 )
 
@@ -181,21 +180,21 @@ func dispatchToBackendThin(w http.ResponseWriter, r *http.Request, cacheDir, rep
 	Throw(cmd.Wait())
 }
 
-// backendEnvThin is backendEnv with GIT_EXEC_PATH pointed at binDir
-// so git-http-backend's `git_cmd`-mode launch of upload-pack /
-// receive-pack picks up our wrappers. We also prepend binDir to PATH
-// — defensive, in case some inner git path lookup falls back to it.
+// backendEnvThin is backendEnv with PATH prepended by binDir so
+// git-http-backend's execvp("git", …) finds our shadow `git`
+// first. The shadow re-exec's `ogorod wrap`, which (after sync)
+// strips binDir from PATH and syscall.Exec's the captured real
+// git — see wrap.go scrubEnv.
 //
-// The wrappers themselves syscall.Exec real `git <subcommand>`,
-// which goes back through git's exec-path lookup; since the real
-// `git` binary's exec-path is shadowed, we explicitly drop
-// GIT_EXEC_PATH from the env we hand to syscall.Exec inside the
-// wrap subcommand to break the loop. (See wrap.go.)
+// OGOROD_REAL_GIT and OGOROD_THIN_BIN_DIR are propagated so the
+// wrap subcommand running as a child knows where to go and what
+// to scrub.
 func backendEnvThin(r *http.Request, cacheDir, repo, subpath string, env Env, binDir string) []string {
 	out := backendEnv(r, cacheDir, repo, subpath, env)
 
-	out = setEnv(out, "GIT_EXEC_PATH", binDir)
 	out = setEnv(out, "PATH", binDir+":"+os.Getenv("PATH"))
+	out = setEnv(out, "OGOROD_REAL_GIT", os.Getenv("OGOROD_REAL_GIT"))
+	out = setEnv(out, "OGOROD_THIN_BIN_DIR", binDir)
 
 	return out
 }
@@ -222,55 +221,44 @@ func splitEnv(kv string) (k, v string, ok bool) {
 	return kv, "", false
 }
 
-// installPathWrappers populates binDir with a "shadow" git exec-path:
-// every helper from the real exec-path is symlinked in, then we
-// overlay our wrappers for git-upload-pack and git-receive-pack.
+// installPathWrappers writes a single shadow `git` script into
+// binDir. git-http-backend runs `git upload-pack <dir>` and
+// `git receive-pack <dir>` via execvp; PATH lookup finds our
+// shadow first, which re-exec's us as `ogorod wrap <args>`.
 //
-// git-http-backend uses run_command(git_cmd=1) for upload-pack /
-// receive-pack, which resolves through GIT_EXEC_PATH rather than
-// PATH. Setting GIT_EXEC_PATH=binDir makes the backend pick up our
-// wrappers; the symlinks make sure the rest of git's helpers
-// (rev-parse, index-pack, …) still resolve.
+// The wrap subcommand syncs the cache (only for upload-pack /
+// receive-pack — passes other invocations through) and then
+// syscall.Exec's the real git captured at startup.
+//
+// Why a `git` shim rather than per-helper (`git-upload-pack`)
+// shims: in modern git, upload-pack and receive-pack are builtins
+// of the main `git` binary — there are no external git-upload-pack
+// / git-receive-pack processes to intercept. Wrapping `git` itself
+// is the only point that catches both.
 func installPathWrappers(binDir string) {
 	binPath := Throw2(os.Executable())
 
-	realExec := strings.TrimSpace(string(Throw2(exec.Command("git", "--exec-path").Output())))
+	realGit := Throw2(exec.LookPath("git"))
 
-	if realExec == "" {
-		ThrowFmt("git --exec-path returned empty")
+	resolved, err := filepath.EvalSymlinks(realGit)
+
+	if err == nil && resolved != "" {
+		realGit = resolved
 	}
 
-	fmt.Fprintf(os.Stderr, "ogorod serve-thin: shadowing git exec-path %s into %s\n", realExec, binDir)
+	fmt.Fprintf(os.Stderr, "ogorod serve-thin: real git at %s; wrapping into %s\n", realGit, binDir)
 
-	entries := Throw2(os.ReadDir(realExec))
+	scriptPath := filepath.Join(binDir, "git")
 
-	for _, e := range entries {
-		name := e.Name()
-		link := filepath.Join(binDir, name)
+	os.Remove(scriptPath)
 
-		// Stale symlink/file: replace.
-		os.Remove(link)
-		Throw(os.Symlink(filepath.Join(realExec, name), link))
-	}
+	wrapper := "#!/bin/sh\nexec " + binPath + " wrap \"$@\"\n"
+	Throw(os.WriteFile(scriptPath, []byte(wrapper), 0o755))
 
-	fmt.Fprintf(os.Stderr, "ogorod serve-thin: linked %d helpers from %s\n", len(entries), realExec)
-
-	// Overlay our wrappers — overwrite the symlinks we just made.
-	for _, sub := range []string{"upload-pack", "receive-pack"} {
-		path := filepath.Join(binDir, "git-"+sub)
-		os.Remove(path)
-		writeWrapper(binDir, "git-"+sub, binPath, sub)
-	}
+	// Stash the resolved real-git path in the env so wrap.go can
+	// syscall.Exec it without doing its own PATH lookup (PATH now
+	// has our shim first). Cleared on each startup.
+	Throw(os.Setenv("OGOROD_REAL_GIT", realGit))
+	Throw(os.Setenv("OGOROD_THIN_BIN_DIR", binDir))
 }
 
-func writeWrapper(binDir, name, ogorodBin, sub string) {
-	content := "#!/bin/sh\nexec " + ogorodBin + " wrap " + sub + " \"$@\"\n"
-
-	path := filepath.Join(binDir, name)
-
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
-		return
-	}
-
-	Throw(os.WriteFile(path, []byte(content), 0o755))
-}
