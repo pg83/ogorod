@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 // EtcdClient scopes all ref operations to one repository under the
@@ -115,4 +117,65 @@ func (e *EtcdClient) PutHEADIfMissing(ctx context.Context, target string) {
 		If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
 		Then(clientv3.OpPut(key, value)).
 		Commit())
+}
+
+// repoName extracts the repo identifier from the etcd root path.
+// e.root is "/ogorod/refs/<repo>", so trim the prefix.
+func (e *EtcdClient) repoName() string {
+	return strings.TrimPrefix(e.root, "/ogorod/refs/")
+}
+
+func (e *EtcdClient) versionKey() string {
+	return "/ogorod/version/" + e.repoName()
+}
+
+// GetVersion reads the monotonic repo version. Returns 0 if unset.
+// Bumped on every successful push; used by sync to skip cache work
+// when nothing has changed.
+func (e *EtcdClient) GetVersion(ctx context.Context) int64 {
+	resp := Throw2(e.cli.Get(ctx, e.versionKey()))
+
+	if len(resp.Kvs) == 0 {
+		return 0
+	}
+
+	return Throw2(strconv.ParseInt(string(resp.Kvs[0].Value), 10, 64))
+}
+
+// BumpVersion increments the repo version. Caller must hold the
+// push lock; the read-then-write is racy without it.
+func (e *EtcdClient) BumpVersion(ctx context.Context) int64 {
+	next := e.GetVersion(ctx) + 1
+
+	Throw2(e.cli.Put(ctx, e.versionKey(), strconv.FormatInt(next, 10)))
+
+	return next
+}
+
+// RepoLock holds an etcd session+mutex pair scoped to one repo.
+// Auto-released if the process dies — session keepalive stops,
+// lease expires, mutex frees.
+type RepoLock struct {
+	sess *concurrency.Session
+	mu   *concurrency.Mutex
+}
+
+// AcquireLock takes /ogorod/lock/<repo> via etcd Mutex. TTL=60s
+// is the session lease; pre-receive normally finishes in seconds,
+// and longer ops are kept alive automatically by the session.
+func (e *EtcdClient) AcquireLock(ctx context.Context) *RepoLock {
+	lockKey := "/ogorod/lock/" + e.repoName()
+
+	sess := Throw2(concurrency.NewSession(e.cli, concurrency.WithTTL(60)))
+
+	mu := concurrency.NewMutex(sess, lockKey)
+	Throw(mu.Lock(ctx))
+
+	return &RepoLock{sess: sess, mu: mu}
+}
+
+// Unlock releases the etcd mutex and closes the session.
+func (l *RepoLock) Unlock(ctx context.Context) {
+	Throw(l.mu.Unlock(ctx))
+	Throw(l.sess.Close())
 }
