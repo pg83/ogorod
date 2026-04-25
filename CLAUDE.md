@@ -61,8 +61,8 @@ Flat — no two-byte prefix sharding (filesystem reason, not S3).
 
 ### Local cache (server mode)
 
-Each lab host's server materializes a bare git repo per repo at
-`/var/cache/ogorod/<repo>.git/`:
+Each lab host's server materializes a bare git repo per repo under
+`/var/run/ogorod_{serve,thin}/home/cache/<repo>.git/`:
 
 ```
 HEAD                   from etcd /ogorod/refs/<repo>/HEAD
