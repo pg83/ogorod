@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -104,17 +105,31 @@ func syncPacks(ctx context.Context, s3 *S3Client, cacheDir string) {
 
 // writePackedRefs flushes the etcd ref map to <cacheDir>/packed-refs
 // in git's standard format. HEAD is excluded — handled separately.
+//
+// Header declares "sorted" so git's packed-refs reader uses bisect
+// for ref lookups (and asserts on any out-of-order entry — which
+// is the BUG-then-corruption-abort path you don't want git in).
+// Map iteration in Go is randomised, so we explicitly sort by ref
+// name before emitting.
 func writePackedRefs(cacheDir string, refs map[string]string) {
-	var b strings.Builder
+	names := make([]string, 0, len(refs))
 
-	b.WriteString("# pack-refs with: peeled fully-peeled sorted\n")
-
-	for name, sha := range refs {
+	for name := range refs {
 		if name == "HEAD" {
 			continue
 		}
 
-		fmt.Fprintf(&b, "%s %s\n", sha, name)
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	var b strings.Builder
+
+	b.WriteString("# pack-refs with: peeled fully-peeled sorted\n")
+
+	for _, name := range names {
+		fmt.Fprintf(&b, "%s %s\n", refs[name], name)
 	}
 
 	Throw(os.WriteFile(filepath.Join(cacheDir, "packed-refs"), []byte(b.String()), 0o644))
