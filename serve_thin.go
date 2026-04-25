@@ -260,9 +260,18 @@ func installPathWrappers(binDir string) {
 
 	fmt.Fprintf(os.Stderr, "ogorod serve-thin: real git=%s exec-path=%s; shimming into %s\n", realGit, realExec, binDir)
 
-	scriptPath := filepath.Join(binDir, "git")
+	// Wipe stale entries from previous deploys: the older shadow-
+	// exec-path scheme symlinked all 175 helpers in here plus
+	// per-binary wrappers for upload-pack/receive-pack. With the
+	// current `git`-only shim approach, anything else in binDir is
+	// just clutter that could shadow a real helper at lookup time.
+	entries := Throw2(os.ReadDir(binDir))
 
-	os.Remove(scriptPath)
+	for _, e := range entries {
+		Throw(os.Remove(filepath.Join(binDir, e.Name())))
+	}
+
+	scriptPath := filepath.Join(binDir, "git")
 
 	wrapper := "#!/bin/sh\nexec " + binPath + " wrap \"$@\"\n"
 	Throw(os.WriteFile(scriptPath, []byte(wrapper), 0o755))
