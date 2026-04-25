@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +50,8 @@ func wrapMain(args []string) {
 	}
 
 	repo := strings.TrimSuffix(filepath.Base(gitDir), ".git")
+
+	fmt.Fprintf(os.Stderr, "ogorod wrap %s: dir=%s repo=%s\n", sub, gitDir, repo)
 
 	env := loadEnv()
 	ec := newEtcdClient(env, repo)

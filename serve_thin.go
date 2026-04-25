@@ -240,6 +240,8 @@ func installPathWrappers(binDir string) {
 		ThrowFmt("git --exec-path returned empty")
 	}
 
+	fmt.Fprintf(os.Stderr, "ogorod serve-thin: shadowing git exec-path %s into %s\n", realExec, binDir)
+
 	entries := Throw2(os.ReadDir(realExec))
 
 	for _, e := range entries {
@@ -250,6 +252,8 @@ func installPathWrappers(binDir string) {
 		os.Remove(link)
 		Throw(os.Symlink(filepath.Join(realExec, name), link))
 	}
+
+	fmt.Fprintf(os.Stderr, "ogorod serve-thin: linked %d helpers from %s\n", len(entries), realExec)
 
 	// Overlay our wrappers — overwrite the symlinks we just made.
 	for _, sub := range []string{"upload-pack", "receive-pack"} {
