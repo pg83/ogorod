@@ -49,6 +49,16 @@ func wrapMain(args []string) {
 		gitDir := findRepoDir(args[1:])
 
 		if gitDir != "" {
+			// http-backend chdirs into the bare repo and passes "."
+			// as the path to upload-pack/receive-pack — resolve to
+			// absolute so doSync's filepath.Base picks up the
+			// actual repo name, not "." literal.
+			abs, err := filepath.Abs(gitDir)
+
+			if err == nil {
+				gitDir = abs
+			}
+
 			doSync(sub, gitDir)
 		}
 	}
