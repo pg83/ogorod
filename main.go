@@ -31,12 +31,16 @@ func main() {
 
 func adminMain(args []string) {
 	if len(args) < 1 {
-		ThrowFmt("usage: ogorod {serve|hook|gc|repack} [args...]")
+		ThrowFmt("usage: ogorod {serve|serve-thin|wrap|hook|gc|repack} [args...]")
 	}
 
 	switch args[0] {
 	case "serve":
 		serveMain(args[1:])
+	case "serve-thin":
+		serveThinMain(args[1:])
+	case "wrap":
+		wrapMain(args[1:])
 	case "hook":
 		hookMain(args[1:])
 	case "gc":
