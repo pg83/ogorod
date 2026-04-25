@@ -49,6 +49,11 @@ func SyncRepo(ctx context.Context, ec *EtcdClient, s3 *S3Client, cacheDir string
 
 // ensureBareRepo creates the minimal layout git expects for a bare
 // repo if cacheDir doesn't yet exist. Idempotent.
+//
+// Writes HEAD + packed-refs unconditionally on first creation so a
+// fresh repo (etcd version=0, never pushed) still answers info/refs
+// instead of 404'ing when git-http-backend tries to read its layout.
+// SyncRepo will overwrite HEAD/packed-refs once etcd has real state.
 func ensureBareRepo(cacheDir string) {
 	for _, sub := range []string{"objects/pack", "objects/info", "refs/heads", "refs/tags", "info", "hooks"} {
 		Throw(os.MkdirAll(filepath.Join(cacheDir, sub), 0o755))
@@ -73,6 +78,21 @@ func ensureBareRepo(cacheDir string) {
 				"[receive]\n"+
 				"\tunpackLimit = 0\n",
 		), 0o644))
+	}
+
+	headPath := filepath.Join(cacheDir, "HEAD")
+
+	if _, err := os.Stat(headPath); os.IsNotExist(err) {
+		// Placeholder HEAD until etcd has a real one. The hook's
+		// PutHEADIfMissing on first push will pick whatever branch
+		// the user actually creates; sync will then overwrite this.
+		Throw(os.WriteFile(headPath, []byte("ref: refs/heads/master\n"), 0o644))
+	}
+
+	refsPath := filepath.Join(cacheDir, "packed-refs")
+
+	if _, err := os.Stat(refsPath); os.IsNotExist(err) {
+		Throw(os.WriteFile(refsPath, []byte("# pack-refs with: peeled fully-peeled sorted\n"), 0o644))
 	}
 }
 
