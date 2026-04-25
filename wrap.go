@@ -65,7 +65,21 @@ func wrapMain(args []string) {
 
 	realArgs := append([]string{"git", sub}, rest...)
 
-	Throw(syscall.Exec(gitPath, realArgs, os.Environ()))
+	// Drop GIT_EXEC_PATH so the real git resolves through its
+	// compiled-in exec-path, not the wrapper-shadow dir we came
+	// from — otherwise `git upload-pack` re-finds our wrapper and
+	// loops forever.
+	envOut := make([]string, 0, len(os.Environ()))
+
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "GIT_EXEC_PATH=") {
+			continue
+		}
+
+		envOut = append(envOut, kv)
+	}
+
+	Throw(syscall.Exec(gitPath, realArgs, envOut))
 }
 
 // findRepoDir returns the first non-flag argument, which is the
