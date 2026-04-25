@@ -99,16 +99,21 @@ func readRefUpdates() []hookUpdate {
 	return out
 }
 
-// uploadNewPacks scans <gitDir>/objects/pack for *.pack files that
-// don't yet exist in S3, and uploads them (pack first, then idx).
+// uploadNewPacks finds *.pack files arriving in this push and ships
+// them (pack first, then idx) to S3 if not already there.
 //
-// Diffing against S3 (rather than mtime) is robust: even if the
-// hook runs minutes after receive-pack wrote its files, or if a
-// previous failed hook left local-only packs around, the right
-// thing happens — anything S3-missing gets shipped.
+// pre-receive runs while git-receive-pack still has the incoming
+// objects in a *quarantine* directory (per `git help receive-pack`
+// "Quarantine Environment"): the new pack lives at
+// $GIT_OBJECT_DIRECTORY/pack/, *not* in <gitDir>/objects/pack/. The
+// promotion to the main object store happens only after every hook
+// returns 0. Scanning main back when we used to do it caught packs
+// from the *previous* push (lag-by-one) — first push uploaded
+// nothing, every subsequent push uploaded the prior push's pack,
+// and the latest push's pack was always orphaned. Now we walk
+// every object dir git tells us about — the quarantine one and
+// any alternates — and pick up everything S3 doesn't have.
 func uploadNewPacks(ctx context.Context, s3 *S3Client, gitDir string) {
-	packDir := filepath.Join(gitDir, "objects", "pack")
-
 	remote := s3.ListPacks(ctx)
 
 	remoteSet := make(map[string]struct{}, len(remote))
@@ -117,32 +122,70 @@ func uploadNewPacks(ctx context.Context, s3 *S3Client, gitDir string) {
 		remoteSet[n] = struct{}{}
 	}
 
-	entries := Throw2(os.ReadDir(packDir))
+	for _, packDir := range packDirs(gitDir) {
+		entries, err := os.ReadDir(packDir)
 
-	for _, e := range entries {
-		name := e.Name()
-
-		if !strings.HasSuffix(name, ".pack") {
+		if err != nil {
 			continue
 		}
 
-		base := strings.TrimSuffix(name, ".pack")
+		for _, e := range entries {
+			name := e.Name()
 
-		if _, ok := remoteSet[base]; ok {
-			continue
+			if !strings.HasSuffix(name, ".pack") {
+				continue
+			}
+
+			base := strings.TrimSuffix(name, ".pack")
+
+			if _, ok := remoteSet[base]; ok {
+				continue
+			}
+
+			packBytes := Throw2(os.ReadFile(filepath.Join(packDir, base+".pack")))
+			idxBytes := Throw2(os.ReadFile(filepath.Join(packDir, base+".idx")))
+
+			// Pack before idx: a fetcher that lists by .idx and
+			// finds one must also find the matching .pack.
+			s3.PutPack(ctx, base+".pack", packBytes)
+			s3.PutPack(ctx, base+".idx", idxBytes)
+
+			remoteSet[base] = struct{}{}
+
+			fmt.Fprintf(os.Stderr, "ogorod-hook: uploaded %s.pack (%d bytes), %s.idx (%d bytes) from %s\n",
+				base, len(packBytes), base, len(idxBytes), packDir)
 		}
-
-		packBytes := Throw2(os.ReadFile(filepath.Join(packDir, base+".pack")))
-		idxBytes := Throw2(os.ReadFile(filepath.Join(packDir, base+".idx")))
-
-		// Pack before idx: a fetcher that lists by .idx and finds
-		// one must also find the matching .pack.
-		s3.PutPack(ctx, base+".pack", packBytes)
-		s3.PutPack(ctx, base+".idx", idxBytes)
-
-		fmt.Fprintf(os.Stderr, "ogorod-hook: uploaded %s.pack (%d bytes), %s.idx (%d bytes)\n",
-			base, len(packBytes), base, len(idxBytes))
 	}
+}
+
+// packDirs returns every objects/pack directory that might hold a
+// pack relevant to this push:
+//
+//   - $GIT_OBJECT_DIRECTORY/pack — the quarantine dir where
+//     receive-pack drops incoming packs before promotion;
+//   - $GIT_ALTERNATE_OBJECT_DIRECTORIES (colon-separated) — typically
+//     points at the main object store while quarantine is active;
+//   - <gitDir>/objects/pack — the main store fallback when no
+//     quarantine env is set (defensive — in practice receive-pack
+//     always sets up quarantine on modern git).
+func packDirs(gitDir string) []string {
+	var out []string
+
+	if v := os.Getenv("GIT_OBJECT_DIRECTORY"); v != "" {
+		out = append(out, filepath.Join(v, "pack"))
+	}
+
+	if v := os.Getenv("GIT_ALTERNATE_OBJECT_DIRECTORIES"); v != "" {
+		for _, p := range strings.Split(v, ":") {
+			if p != "" {
+				out = append(out, filepath.Join(p, "pack"))
+			}
+		}
+	}
+
+	out = append(out, filepath.Join(gitDir, "objects", "pack"))
+
+	return out
 }
 
 // casRefs maps git's "0000…0000" sentinel for create/delete to our
