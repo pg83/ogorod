@@ -39,6 +39,8 @@ func SyncRepo(ctx context.Context, ec *EtcdClient, s3 *S3Client, cacheDir string
 	syncPacks(ctx, s3, cacheDir)
 
 	refs := ec.ListRefs(ctx)
+
+	wipeLooseRefs(cacheDir)
 	writePackedRefs(cacheDir, refs)
 
 	if head, ok := refs["HEAD"]; ok {
@@ -46,6 +48,23 @@ func SyncRepo(ctx context.Context, ec *EtcdClient, s3 *S3Client, cacheDir string
 	}
 
 	writeLocalVersion(cacheDir, remoteVersion)
+}
+
+// wipeLooseRefs removes any loose ref files under <cacheDir>/refs/.
+// git http-backend prefers loose refs over packed-refs at lookup,
+// so a leftover loose entry from an earlier incarnation would
+// shadow the freshly-synthesised packed-refs and have us advertise
+// stale SHAs. Mirror-style pushers then send `<old> = <stale>` and
+// the hook's CAS rejects them — push wedges in a tight retry loop
+// even though etcd is already correct. Wipe the loose tree on
+// every sync so packed-refs (regenerated from etcd) is the only
+// source of truth git ever sees.
+func wipeLooseRefs(cacheDir string) {
+	Throw(os.RemoveAll(filepath.Join(cacheDir, "refs")))
+
+	for _, sub := range []string{"refs/heads", "refs/tags"} {
+		Throw(os.MkdirAll(filepath.Join(cacheDir, sub), 0o755))
+	}
 }
 
 // ensureBareRepo creates the minimal layout git expects for a bare
