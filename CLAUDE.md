@@ -14,6 +14,10 @@ during transition; will be removed once the server is established.
 See [`README.md`](README.md) for the user-facing picture and
 [`STYLE.md`](STYLE.md) for code conventions.
 
+## Coding conventions
+
+- Git author: `claude <claude@users.noreply.github.com>`. Commit messages in English.
+
 ## Non-negotiable rules
 
 - **Error handling via `Throw`/`Try`** (see `throw.go`). Forbidden: `if err != nil { return err }` pass-through. Use `Throw2(fn())`, `Throw(err)`, `ThrowFmt(...)`. Catch at boundaries (top-level main, helper command loop, goroutine entries).
